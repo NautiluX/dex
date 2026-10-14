@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -32,7 +33,8 @@ var (
 		"groups_2@dexidp.com": {{Email: "groups_0@dexidp.com"}},
 		"groups_0@dexidp.com": {},
 	}
-	callCounter = make(map[string]int)
+	callCounterMu sync.Mutex
+	callCounter   = make(map[string]int)
 )
 
 func testSetup() *httptest.Server {
@@ -42,8 +44,10 @@ func testSetup() *httptest.Server {
 		w.Header().Add("Content-Type", "application/json")
 		userKey := r.URL.Query().Get("userKey")
 		if groups, ok := testGroups[userKey]; ok {
-			json.NewEncoder(w).Encode(admin.Groups{Groups: groups})
+			callCounterMu.Lock()
 			callCounter[userKey]++
+			callCounterMu.Unlock()
+			json.NewEncoder(w).Encode(admin.Groups{Groups: groups})
 		}
 	})
 
@@ -224,19 +228,22 @@ func TestGetGroups(t *testing.T) {
 		},
 	} {
 		testCase := testCase
+		callCounterMu.Lock()
 		callCounter = map[string]int{}
+		callCounterMu.Unlock()
 		t.Run(name, func(t *testing.T) {
 			assert := assert.New(t)
-			lookup := make(map[string]struct{})
 
-			groups, err := conn.getGroups(testCase.userKey, testCase.fetchTransitiveGroupMembership, lookup)
+			groups, err := conn.getGroups(context.Background(), testCase.userKey, testCase.fetchTransitiveGroupMembership)
 			if testCase.shouldErr {
 				assert.NotNil(err)
 			} else {
 				assert.Nil(err)
 			}
 			assert.ElementsMatch(testCase.expectedGroups, groups)
+			callCounterMu.Lock()
 			t.Logf("[%s] Amount of API calls per userKey: %+v\n", t.Name(), callCounter)
+			callCounterMu.Unlock()
 		})
 	}
 }
@@ -280,18 +287,21 @@ func TestDomainToAdminEmailConfig(t *testing.T) {
 		},
 	} {
 		testCase := testCase
+		callCounterMu.Lock()
 		callCounter = map[string]int{}
+		callCounterMu.Unlock()
 		t.Run(name, func(t *testing.T) {
 			assert := assert.New(t)
-			lookup := make(map[string]struct{})
 
-			_, err := conn.getGroups(testCase.userKey, true, lookup)
+			_, err := conn.getGroups(context.Background(), testCase.userKey, true)
 			if testCase.expectedErr != "" {
 				assert.ErrorContains(err, testCase.expectedErr)
 			} else {
 				assert.Nil(err)
 			}
+			callCounterMu.Lock()
 			t.Logf("[%s] Amount of API calls per userKey: %+v\n", t.Name(), callCounter)
+			callCounterMu.Unlock()
 		})
 	}
 }
@@ -381,9 +391,8 @@ func TestGCEWorkloadIdentity(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			assert := assert.New(t)
-			lookup := make(map[string]struct{})
 
-			_, err := conn.getGroups(testCase.userKey, true, lookup)
+			_, err := conn.getGroups(context.Background(), testCase.userKey, true)
 			if testCase.expectedErr != "" {
 				assert.ErrorContains(err, testCase.expectedErr)
 			} else {
