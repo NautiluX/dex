@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"sort"
@@ -18,7 +19,9 @@ import (
 	"golang.org/x/exp/slices"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"golang.org/x/time/rate"
 	admin "google.golang.org/api/admin/directory/v1"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/impersonate"
 	"google.golang.org/api/option"
 
@@ -27,9 +30,11 @@ import (
 )
 
 const (
-	issuerURL                     = "https://accounts.google.com"
-	wildcardDomainToAdminEmail    = "*"
-	defaultConcurrentGroupLookups = 5
+	issuerURL                           = "https://accounts.google.com"
+	wildcardDomainToAdminEmail          = "*"
+	defaultConcurrentGroupLookups       = 5
+	defaultGroupLookupRequestsPerSecond = 10
+	maxGroupLookupAttempts              = 4
 )
 
 // Config holds configuration options for Google logins.
@@ -67,6 +72,10 @@ type Config struct {
 	// MaxConcurrentGroupLookups limits Directory API requests across all logins
 	// using this connector. Values <= 0 use the default of 5.
 	MaxConcurrentGroupLookups int `json:"maxConcurrentGroupLookups"`
+
+	// MaxGroupLookupRequestsPerSecond limits request starts across this connector,
+	// including retries. Values <= 0 use the default of 10; the burst is 1.
+	MaxGroupLookupRequestsPerSecond float64 `json:"maxGroupLookupRequestsPerSecond"`
 
 	// Optional value for the prompt parameter, defaults to consent when offline_access
 	// scope is requested
@@ -129,6 +138,10 @@ func (c *Config) Open(id string, logger *slog.Logger) (conn connector.Connector,
 	if maxConcurrent <= 0 {
 		maxConcurrent = defaultConcurrentGroupLookups
 	}
+	maxRate := c.MaxGroupLookupRequestsPerSecond
+	if maxRate <= 0 {
+		maxRate = defaultGroupLookupRequestsPerSecond
+	}
 	clientID := c.ClientID
 	return &googleConnector{
 		redirectURI: c.RedirectURI,
@@ -150,6 +163,7 @@ func (c *Config) Open(id string, logger *slog.Logger) (conn connector.Connector,
 		domainToAdminEmail:             c.DomainToAdminEmail,
 		fetchTransitiveGroupMembership: c.FetchTransitiveGroupMembership,
 		groupLookupSlots:               make(chan struct{}, maxConcurrent),
+		groupLookupLimiter:             rate.NewLimiter(rate.Limit(maxRate), 1),
 		adminSrv:                       adminSrv,
 		promptType:                     promptType,
 	}, nil
@@ -172,6 +186,7 @@ type googleConnector struct {
 	domainToAdminEmail             map[string]string
 	fetchTransitiveGroupMembership bool
 	groupLookupSlots               chan struct{}
+	groupLookupLimiter             *rate.Limiter
 	adminSrv                       map[string]*admin.Service
 	promptType                     string
 }
@@ -309,49 +324,52 @@ func (c *googleConnector) createIdentity(ctx context.Context, identity connector
 	return identity, nil
 }
 
-// getGroups creates a connection to the admin directory service and lists
-// all groups the user is a member of
-func (c *googleConnector) getGroups(ctx context.Context, email string, fetchTransitiveGroupMembership bool) ([]string, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+type groupLookupResult struct {
+	groups []string
+	err    error
+}
 
-	type result struct {
-		groups []string
-		err    error
-	}
+// getGroups lists direct or transitive memberships, with bounded workers.
+func (c *googleConnector) getGroups(ctx context.Context, email string, transitive bool) ([]string, error) {
+	ctx, cancel := context.WithCancel(ctx)
 	jobs := make(chan string)
-	results := make(chan result)
+	results := make(chan groupLookupResult)
 	var workers sync.WaitGroup
 	for i := 0; i < cap(c.groupLookupSlots); i++ {
-		workers.Go(func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case member := <-jobs:
-					groups, err := c.listGroupEmails(ctx, member)
-					select {
-					case results <- result{groups, err}:
-					case <-ctx.Done():
-						return
-					}
-				}
-			}
-		})
+		workers.Go(func() { c.groupLookupWorker(ctx, jobs, results) })
 	}
 	defer func() {
 		cancel()
 		workers.Wait()
 	}()
+	return collectGroupResults(ctx, email, transitive, jobs, results)
+}
 
+func (c *googleConnector) groupLookupWorker(ctx context.Context, jobs <-chan string, results chan<- groupLookupResult) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case member := <-jobs:
+			groups, err := c.listGroupEmails(ctx, member)
+			select {
+			case results <- groupLookupResult{groups, err}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+func collectGroupResults(ctx context.Context, email string, transitive bool, jobs chan<- string, results <-chan groupLookupResult) ([]string, error) {
 	// Only the coordinator touches the queue and visited set. Workers never
 	// schedule children or wait for another worker while holding an API slot.
 	pending := []string{email}
 	seen := make(map[string]struct{})
-	var userGroups []string
+	var groups []string
 	inFlight := 0
 	for len(pending) > 0 || inFlight > 0 {
-		var ready chan string
+		var ready chan<- string
 		var member string
 		if len(pending) > 0 {
 			ready, member = jobs, pending[0]
@@ -372,35 +390,22 @@ func (c *googleConnector) getGroups(ctx context.Context, email string, fetchTran
 					continue
 				}
 				seen[group] = struct{}{}
-				userGroups = append(userGroups, group)
-				if fetchTransitiveGroupMembership {
+				groups = append(groups, group)
+				if transitive {
 					pending = append(pending, group)
 				}
 			}
 		}
 	}
-	sort.Strings(userGroups)
-	return userGroups, nil
+	sort.Strings(groups)
+	return groups, nil
 }
 
 func (c *googleConnector) listGroupEmails(ctx context.Context, member string) ([]string, error) {
-	domain := c.extractDomainFromEmail(member)
-	adminSrv, err := c.findAdminService(domain)
-	if err != nil {
-		return nil, err
-	}
-
 	var groupEmails []string
 	pageToken := ""
 	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case c.groupLookupSlots <- struct{}{}:
-		}
-		groupsList, err := adminSrv.Groups.List().
-			UserKey(member).PageToken(pageToken).Context(ctx).Do()
-		<-c.groupLookupSlots
+		groupsList, err := c.fetchGroupPage(ctx, member, pageToken)
 		if err != nil {
 			return nil, fmt.Errorf("could not list groups: %w", err)
 		}
@@ -414,6 +419,57 @@ func (c *googleConnector) listGroupEmails(ctx context.Context, member string) ([
 		pageToken = groupsList.NextPageToken
 	}
 	return groupEmails, nil
+}
+
+// fetchGroupPage releases the API slot before backing off, so other logins
+// can continue. Every attempt is rate-limited and bound to the login context.
+func (c *googleConnector) fetchGroupPage(ctx context.Context, member, pageToken string) (*admin.Groups, error) {
+	srv, err := c.findAdminService(c.extractDomainFromEmail(member))
+	if err != nil {
+		return nil, err
+	}
+	for attempt := 0; ; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case c.groupLookupSlots <- struct{}{}:
+		}
+		if err := c.groupLookupLimiter.Wait(ctx); err != nil {
+			<-c.groupLookupSlots
+			return nil, err
+		}
+		page, err := srv.Groups.List().UserKey(member).PageToken(pageToken).Context(ctx).Do()
+		<-c.groupLookupSlots
+		if !isGroupQuotaError(err) || attempt+1 == maxGroupLookupAttempts {
+			return page, err
+		}
+		delay := time.Second<<attempt + time.Duration(rand.IntN(250))*time.Millisecond
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func isGroupQuotaError(err error) bool {
+	var apiErr *googleapi.Error
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	if apiErr.Code == http.StatusTooManyRequests {
+		return true
+	}
+	if apiErr.Code == http.StatusForbidden {
+		for _, item := range apiErr.Errors {
+			if item.Reason == "rateLimitExceeded" || item.Reason == "userRateLimitExceeded" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (c *googleConnector) findAdminService(domain string) (*admin.Service, error) {

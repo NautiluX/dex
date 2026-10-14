@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/time/rate"
 	admin "google.golang.org/api/admin/directory/v1"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
 
@@ -24,9 +26,10 @@ func groupTestConnector(t testing.TB, limit int, handler http.HandlerFunc) *goog
 	service, err := admin.NewService(context.Background(), option.WithoutAuthentication(), option.WithEndpoint(server.URL))
 	require.NoError(t, err)
 	return &googleConnector{
-		logger:           slog.New(slog.DiscardHandler),
-		adminSrv:         map[string]*admin.Service{wildcardDomainToAdminEmail: service},
-		groupLookupSlots: make(chan struct{}, limit),
+		logger:             slog.New(slog.DiscardHandler),
+		adminSrv:           map[string]*admin.Service{wildcardDomainToAdminEmail: service},
+		groupLookupSlots:   make(chan struct{}, limit),
+		groupLookupLimiter: rate.NewLimiter(rate.Inf, 1),
 	}
 }
 
@@ -43,6 +46,7 @@ func TestGroupLookupGraph(t *testing.T) {
 	for _, limit := range []int{1, 5} {
 		for _, transitive := range []bool{false, true} {
 			t.Run(fmt.Sprintf("limit=%d/transitive=%t", limit, transitive), func(t *testing.T) {
+				t.Parallel()
 				var mu sync.Mutex
 				calls := map[string]int{}
 				conn := groupTestConnector(t, limit, func(w http.ResponseWriter, r *http.Request) {
@@ -208,6 +212,156 @@ func TestGroupLookupErrorCancelsSiblings(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("failed lookup did not cancel its sibling request")
 	}
+}
+
+func TestGroupLookupRequestRate(t *testing.T) {
+	starts := make(chan time.Time, 3)
+	conn := groupTestConnector(t, 3, func(w http.ResponseWriter, r *http.Request) {
+		starts <- time.Now()
+		writeGroupPage(w, nil, "")
+	})
+	conn.groupLookupLimiter = rate.NewLimiter(20, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 3)
+	for i := 0; i < 3; i++ {
+		go func() {
+			_, err := conn.getGroups(ctx, "user@example.com", true)
+			done <- err
+		}()
+	}
+	for i := 0; i < 3; i++ {
+		require.NoError(t, <-done)
+	}
+	first, second, third := <-starts, <-starts, <-starts
+	// Allow scheduling noise; three requests at 20/s need two intervals.
+	require.GreaterOrEqual(t, third.Sub(first), 90*time.Millisecond)
+	require.True(t, second.Before(third))
+}
+
+func TestGroupQuotaErrorClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"success", nil, false},
+		{"transport", errors.New("network failure"), false},
+		{"429", &googleapi.Error{Code: 429}, true},
+		{"user quota", &googleapi.Error{Code: 403, Errors: []googleapi.ErrorItem{{Reason: "userRateLimitExceeded"}}}, true},
+		{"account quota", &googleapi.Error{Code: 403, Errors: []googleapi.ErrorItem{{Reason: "rateLimitExceeded"}}}, true},
+		{"permission denied", &googleapi.Error{Code: 403, Errors: []googleapi.ErrorItem{{Reason: "forbidden"}}}, false},
+		{"bad request", &googleapi.Error{Code: 400}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, isGroupQuotaError(tc.err))
+		})
+	}
+}
+
+func TestGroupLookupQuotaRetryKeepsPageToken(t *testing.T) {
+	var mu sync.Mutex
+	calls := map[string]int{}
+	conn := groupTestConnector(t, 1, func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("pageToken")
+		mu.Lock()
+		calls[page]++
+		n := calls[page]
+		mu.Unlock()
+		if page == "" {
+			writeGroupPage(w, []string{"a@example.com"}, "next")
+		} else if n == 1 {
+			http.Error(w, "quota exceeded", http.StatusTooManyRequests)
+		} else {
+			writeGroupPage(w, []string{"b@example.com"}, "")
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	groups, err := conn.getGroups(ctx, "user@example.com", false)
+	require.NoError(t, err)
+	require.Equal(t, []string{"a@example.com", "b@example.com"}, groups)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, map[string]int{"": 1, "next": 2}, calls)
+}
+
+func TestGroupLookupQuotaRetriesAreBounded(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	conn := groupTestConnector(t, 1, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		http.Error(w, "quota exceeded", http.StatusTooManyRequests)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	groups, err := conn.getGroups(ctx, "user@example.com", true)
+	require.ErrorContains(t, err, "quota exceeded")
+	require.Nil(t, groups)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, maxGroupLookupAttempts, calls)
+	require.Empty(t, conn.groupLookupSlots)
+}
+
+func TestGroupLookupRateWaitCancels(t *testing.T) {
+	conn := groupTestConnector(t, 1, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("cancelled rate wait must not issue an API request")
+		writeGroupPage(w, nil, "")
+	})
+	conn.groupLookupLimiter = rate.NewLimiter(rate.Every(time.Hour), 1)
+	require.True(t, conn.groupLookupLimiter.Allow())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := conn.getGroups(ctx, "user@example.com", true)
+		done <- err
+	}()
+	// Observe acquisition of the API slot, proving cancellation interrupts the
+	// limiter wait rather than only cancelling before worker dispatch.
+	require.Eventually(t, func() bool { return len(conn.groupLookupSlots) == 1 }, time.Second, time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("rate wait did not cancel")
+	}
+	require.Empty(t, conn.groupLookupSlots)
+}
+
+func TestGroupLookupBackoffCancels(t *testing.T) {
+	responded := make(chan struct{}, 4)
+	conn := groupTestConnector(t, 1, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "quota exceeded", http.StatusTooManyRequests)
+		w.(http.Flusher).Flush()
+		responded <- struct{}{}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := conn.getGroups(ctx, "user@example.com", true)
+		done <- err
+	}()
+	select {
+	case <-responded:
+	case <-time.After(time.Second):
+		t.Fatal("request did not start")
+	}
+	// The slot is released after the quota response, before the retry timer.
+	require.Eventually(t, func() bool { return len(conn.groupLookupSlots) == 0 }, time.Second, time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("backoff did not cancel")
+	}
+	require.Empty(t, responded, "cancelled lookup must not retry")
 }
 
 func BenchmarkGroupLookup(b *testing.B) {

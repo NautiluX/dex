@@ -33,25 +33,42 @@ var (
 		"groups_2@dexidp.com": {{Email: "groups_0@dexidp.com"}},
 		"groups_0@dexidp.com": {},
 	}
-	callCounterMu sync.Mutex
-	callCounter   = make(map[string]int)
 )
 
-func testSetup() *httptest.Server {
+type groupCallCounter struct {
+	mu    sync.Mutex
+	calls map[string]int
+}
+
+func (c *groupCallCounter) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls = make(map[string]int)
+}
+
+func (c *groupCallCounter) log(t *testing.T) {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t.Logf("[%s] Amount of API calls per userKey: %+v", t.Name(), c.calls)
+}
+
+func testSetup() (*httptest.Server, *groupCallCounter) {
+	counter := &groupCallCounter{calls: make(map[string]int)}
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/admin/directory/v1/groups/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Content-Type", "application/json")
 		userKey := r.URL.Query().Get("userKey")
 		if groups, ok := testGroups[userKey]; ok {
-			callCounterMu.Lock()
-			callCounter[userKey]++
-			callCounterMu.Unlock()
+			counter.mu.Lock()
+			counter.calls[userKey]++
+			counter.mu.Unlock()
 			json.NewEncoder(w).Encode(admin.Groups{Groups: groups})
 		}
 	})
 
-	return httptest.NewServer(mux)
+	return httptest.NewServer(mux), counter
 }
 
 func newConnector(config *Config) (*googleConnector, error) {
@@ -86,7 +103,7 @@ func tempServiceAccountKey() (string, error) {
 }
 
 func TestOpen(t *testing.T) {
-	ts := testSetup()
+	ts, _ := testSetup()
 	defer ts.Close()
 
 	type testCase struct {
@@ -176,7 +193,7 @@ func TestOpen(t *testing.T) {
 }
 
 func TestGetGroups(t *testing.T) {
-	ts := testSetup()
+	ts, counter := testSetup()
 	defer ts.Close()
 
 	serviceAccountFilePath, err := tempServiceAccountKey()
@@ -228,9 +245,7 @@ func TestGetGroups(t *testing.T) {
 		},
 	} {
 		testCase := testCase
-		callCounterMu.Lock()
-		callCounter = map[string]int{}
-		callCounterMu.Unlock()
+		counter.reset()
 		t.Run(name, func(t *testing.T) {
 			assert := assert.New(t)
 
@@ -241,15 +256,13 @@ func TestGetGroups(t *testing.T) {
 				assert.Nil(err)
 			}
 			assert.ElementsMatch(testCase.expectedGroups, groups)
-			callCounterMu.Lock()
-			t.Logf("[%s] Amount of API calls per userKey: %+v\n", t.Name(), callCounter)
-			callCounterMu.Unlock()
+			counter.log(t)
 		})
 	}
 }
 
 func TestDomainToAdminEmailConfig(t *testing.T) {
-	ts := testSetup()
+	ts, counter := testSetup()
 	defer ts.Close()
 
 	serviceAccountFilePath, err := tempServiceAccountKey()
@@ -287,9 +300,7 @@ func TestDomainToAdminEmailConfig(t *testing.T) {
 		},
 	} {
 		testCase := testCase
-		callCounterMu.Lock()
-		callCounter = map[string]int{}
-		callCounterMu.Unlock()
+		counter.reset()
 		t.Run(name, func(t *testing.T) {
 			assert := assert.New(t)
 
@@ -299,9 +310,7 @@ func TestDomainToAdminEmailConfig(t *testing.T) {
 			} else {
 				assert.Nil(err)
 			}
-			callCounterMu.Lock()
-			t.Logf("[%s] Amount of API calls per userKey: %+v\n", t.Name(), callCounter)
-			callCounterMu.Unlock()
+			counter.log(t)
 		})
 	}
 }
@@ -337,7 +346,7 @@ func mockGCEMetadataServer() *httptest.Server {
 }
 
 func TestGCEWorkloadIdentity(t *testing.T) {
-	ts := testSetup()
+	ts, _ := testSetup()
 	defer ts.Close()
 
 	metadataServer := mockGCEMetadataServer()
@@ -426,7 +435,7 @@ func TestPromptTypeConfig(t *testing.T) {
 		},
 	}
 
-	ts := testSetup()
+	ts, _ := testSetup()
 	defer ts.Close()
 
 	serviceAccountFilePath, err := tempServiceAccountKey()
